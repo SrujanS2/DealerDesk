@@ -1,116 +1,51 @@
-# DECISIONS.md — AI / ML track
+# AI / ML track — design decisions
 
-Line numbers refer to the files as committed.
+## 1. Schema and relationships
 
-## 1. Schema: models, relationships, on_delete
+- `Product` is the SKU-keyed catalogue; `Inventory` is a one-to-one stock row; `StockMovement` is the stock audit ledger (`catalog/models.py:5-52`). `Inventory.product` uses `CASCADE` because stock has no meaning without its product. `StockMovement.product` uses `CASCADE` because its history belongs to that product; its optional `order` uses `SET_NULL` so an order removal does not erase the stock event.
+- `Dealer` is the dealer master (`dealers/models.py:4-17`). `Order` belongs to a dealer, and `OrderItem` connects an order to a product (`orders/models.py:5-44`). `Order.dealer` is `PROTECT` to preserve financial history; `OrderItem.order` is `CASCADE` because a line has no meaning without its order; `OrderItem.product` is `PROTECT` to preserve the SKU and description of historical sales.
+- `DailyOrderSequence` stores the per-day number counter. `IdempotencyKey` optionally points one-to-one to its order (`orders/models.py:46-64`); its `CASCADE` is appropriate because the key only identifies that order.
+- `ChatSession` belongs to a dealer and is unique per `(session_id, dealer)`; `ChatMessage` belongs to a session (`assistant/models.py:4-32`). Both use `CASCADE`: conversation memory is disposable, unlike order history.
 
-| Model | Purpose | Key constraints |
-|---|---|---|
-| `Product` (`catalog/models.py:5`) | Catalogue row. `sku` is the business key used in URLs and order lines. | `sku` unique; `price` `DECIMAL(12,2)` with DB check `price > 0`; index on `category` |
-| `Inventory` (`catalog/models.py:26`) | Available stock, 1:1 with Product | DB check `quantity >= 0` (`catalog/models.py:36`) |
-| `StockMovement` (`catalog/models.py:42`) | Append-only ledger of every stock change (audit only) | index `(product, created_at)` |
-| `Dealer` (`dealers/models.py:4`) | Dealer master; `credit_limit` stored, not enforced | `dealer_code` unique |
-| `Order` (`orders/models.py:5`) | Header: number, dealer, status, timestamps | `order_number` unique; indexes `(dealer, status)`, `(status)` |
-| `OrderItem` (`orders/models.py:29`) | Line: product + quantity; `locked_unit_price` stays NULL while DRAFT and is set on confirm (`orders/models.py:36`) | unique `(order, product)`; check `quantity >= 1` |
-| `DailyOrderSequence` (`orders/models.py:46`) | One row per IST day; last NNNN issued | PK `day` |
-| `IdempotencyKey` (`orders/models.py:54`) | `Idempotency-Key` → request hash + order | `key` unique |
-| `ChatSession` / `ChatMessage` (`assistant/models.py:4`, `:20`) | Assistant memory per (session_id, dealer) | unique `(session_id, dealer)` |
+## 2. Retrieval: embeddings, index, ranking, failure modes
 
-Inventory is its own table rather than a column on Product. Confirming an order locks inventory rows with `SELECT … FOR UPDATE`, so a separate table means those locks never block catalogue writes such as a supplier price update, and the reverse. Money is never stored as a float. Line amounts are derived from `unit_price × quantity` rather than stored. A DRAFT's price must follow the catalogue, and a CONFIRMED order's price is frozen in `locked_unit_price`.
+Retrieval intentionally uses lexical BM25, not embeddings: exact fitment numbers matter more than semantic similarity for parts. The in-memory index weights name above category/brand above fitment/description, indexes SKU tokens, and expands a small domain synonym list (`assistant/retrieval.py:28-29`, `:85-96`). The vehicle resolver rejects a fitment unless every number in the request appears in it, preventing a Duke 390 query from matching Duke 200 (`assistant/retrieval.py:105-128`). BM25 scores are multiplied by query-token coverage squared, then weak matches are removed (`assistant/retrieval.py:135-183`). The index refreshes when product count or maximum `updated_at` changes; price and stock are fetched separately at tool time (`assistant/retrieval.py:189-198`; `assistant/tools.py:93-110`).
 
-**on_delete choices**
-- `Inventory.product` CASCADE (`catalog/models.py:30`): stock has no meaning without the product.
-- `Order.dealer` PROTECT (`orders/models.py:15`): orders are financial records, so deleting a dealer must never delete them.
-- `OrderItem.order` CASCADE (`orders/models.py:31`): a line is part of its order.
-- `OrderItem.product` PROTECT (`orders/models.py:33`): a product that appears on any order can't be deleted, so history stays complete.
-- `StockMovement.product` CASCADE (`catalog/models.py:51`): the ledger belongs to the product. In practice PROTECT on OrderItem already prevents deleting any product that was ever ordered.
-- `StockMovement.order` SET_NULL (`catalog/models.py:52`): keep the stock history even if an order row were ever removed.
-- `IdempotencyKey.order` CASCADE (`orders/models.py:60`): the key exists only to point at its order.
-- `ChatSession.dealer` CASCADE (`assistant/models.py:12`) and `ChatMessage.session` CASCADE (`assistant/models.py:24`): chat memory is disposable and holds no financial data.
+It fails on paraphrases with no shared term, misspellings, and unrecognised vehicle aliases. The fixed synonym list and lexical scores cannot reliably infer intent the catalogue never expresses; unknown vehicles are restricted to Universal-fitment results (`assistant/retrieval.py:28-46`, `:150-158`).
 
-## 2. Retrieval
+## 3. Tool-calling loop: message to reply
 
-`assistant/retrieval.py` uses lexical BM25 plus an explicit vehicle resolver, with no embeddings. This is deliberate:
+`ChatView.post` validates the request and dealer before calling `run_turn` (`assistant/views.py:11-31`). `run_turn` loads dealer-scoped history, builds system/history/user messages, and asks the LLM to answer or call one of the tool schemas (`assistant/agent.py:212-224`; prompt and rules at `:34-50`). `_answer` allows up to six rounds; `_tool_round` executes each returned call through `run_tool`, appends the JSON result as a tool message, and repeats (`assistant/agent.py:182-209`; dispatch at `assistant/tools.py:192-201`). After 36 seconds it stops offering tools; the turn has a 48-second deadline (`assistant/agent.py:29-33`, `:184-209`). Before persistence, `verify_reply` checks the draft; a failed check triggers one repair attempt, then messages are stored and the reply, cited SKUs, calls, and actions are returned (`assistant/agent.py:242-262`).
 
-- **Fitment is decided by exact tokens.** "Duke 390" and "Duke 200" are close neighbours in embedding space, and recommending the wrong one is the worst failure for a parts dealer. `resolve_vehicle` (`assistant/retrieval.py:105`) requires every number the dealer typed to appear in the fitment (`:122`). Aliases ("RE" → Royal Enfield, "ns 200" → NS200) are handled by tokenising both split and joined forms.
-- **Ranking.** BM25 per query word group (the word plus its synonyms, `SYNONYMS` at `:28`), multiplied by coverage² (`:173`). So "brake pads" ranks Brake Pad Sets far above Tank Pads, which only match "pad". Results are filtered to the resolved fitment plus Universal items. If the vehicle isn't in the catalogue at all (e.g. Activa), only Universal items are returned, together with the list of vehicles we do stock (`:155`).
-- **Index.** The 600 products sit in memory and are rebuilt when the catalogue fingerprint (count, max `updated_at`) changes (`:189`). Search is deterministic, which matters because the grader runs each test 3 times. It also needs no extra API calls or model downloads. **Price and stock are never part of the index**: they are read from the database on every tool call.
+## 4. Prices and stock: what the guard actually guarantees
 
-**Where it fails:** pure semantic paraphrases with no shared words ("something to stop my bike" for brake pads) unless the lexicon covers them; misspellings ("brk pads"); and vehicles we don't stock. The LLM partly makes up for this by rewriting the dealer's text into catalogue terms before calling `search_parts`. Hybrid search with a small embedding model would be my next step.
+`search_parts` and `check_stock` query `Product` and related `Inventory` rows when invoked; `_product_view` formats the database price and stock (`assistant/tools.py:93-110`, `:113-148`). Earlier tool results are redacted from replayed history (`assistant/agent.py:72-101`). `verify_reply` checks parsed currency and stock claims against figures in this turn's tool results, rejects unknown SKUs and discount promises, and can request a repair (`assistant/agent.py:108-160`, `:242-249`; tests at `assistant/tests.py:68-85`).
 
-## 3. The tool-calling loop
+This is **not** a strict “database at the instant the reply is sent” guarantee: tool values are a read-time snapshot, not held under a lock until the LLM finishes. The verifier is regex-based and only checks claim formats it recognises; numbers written as words or differently phrased claims can evade it. Therefore the accurate claim is “grounded in current-turn tool results and checked for common numeric formats,” not “impossible to state a stale or unsupported figure.”
 
-1. `ChatView` (`assistant/views.py`) validates `session_id`, `dealer_id` and `message`, then calls `run_turn` (`assistant/agent.py:212`).
-2. `run_turn` loads memory for this (session_id, dealer) with `load_history` (`:84`). It builds `[system prompt] + history + [user]` (`:219`). The system prompt (`:34`) states the grounding, fitment, draft-only, injection and off-topic rules.
-3. `_answer` (`:202`) runs up to 6 rounds of `_tool_round` (`:182`). Each round calls the provider through `assistant/llm.py` (OpenAI-compatible client for Gemini, OpenAI and Groq at `:121`; Anthropic converted at `:177`) with the three tool schemas. Every tool call the model returns is appended to `tool_calls` in order (`:193`), executed against the live database by `run_tool` (`assistant/tools.py:192`), and fed back as a `tool` message (`:194`). When the model answers with text, the loop ends. After 36 seconds tools are no longer offered, forcing a text answer (`:184`), which keeps the response under 60 seconds.
-4. The draft reply is checked by `verify_reply` (`:225`, defined at `:141`). If it fails, the model gets one repair round with the specific problems listed (`REPAIR_PROMPT`, `:53`). The repair round can call tools again.
-5. The turn is persisted (`:243`) and the response returned. `cited_skus` (`:165`) are the SKUs mentioned in the reply that exist in the database. `actions` come from `create_draft_order` (`assistant/tools.py:151`).
+## 5. Untrusted supplier descriptions and where the defence stops
 
-## 4. Prices and stock: never a stale figure
+Supplier-facing name, brand, and description strings pass through `sanitize_text`, which drops sentences matching `INJECTION_RE`; tool output is tagged `catalogue_data`, and the system prompt says supplier text is data, not instructions (`assistant/tools.py:70-89`, `:93-105`; `assistant/agent.py:45-50`). The tools also limit impact: they can search, check stock, or create a draft, but cannot confirm an order or directly edit price or inventory (`assistant/tools.py:18-61`, `:151-180`).
 
-- **Tools read the database at call time.** `_product_view` (`assistant/tools.py:93`) reads `price` and `Inventory.quantity` on every call; nothing is cached.
-- **Old figures are removed from memory.** On replay, tool results from earlier turns lose every price/stock/total field (`_redact`, `assistant/agent.py:72`), keeping only SKUs, names and order numbers. To state a figure, the model has to call a tool in this turn.
-- **Code checks every figure.** `verify_reply` (`assistant/agent.py:141`) extracts every rupee amount and stock-like count from the reply and checks each against figures returned by tools *in this turn* (`_collect_figures`, `:108`). Price × quantity is allowed for quantities the dealer mentioned. Figures stated without any tool call this turn, unknown SKUs, and discount promises all trigger a repair round. Tested in `assistant/tests.py` (`test_invented_figure_triggers_repair`).
-- **Drafts use the same order rules.** `create_draft_order` calls the same `orders.services.create_order` as `POST /api/orders/`, with an idempotency key scoped to the turn (`assistant/tools.py:165`), so a repeated identical call can't create two drafts. Order totals come from the same GST code.
+The filter is pattern-based, not a proof against prompt injection. A paraphrased instruction that matches none of its patterns can reach the model, and safety then depends on the model following the system prompt. The output checker also only catches discount promises matching its patterns (`assistant/agent.py:67`, `:141-160`). The sanitizer does not cover every catalogue field: `category` and `vehicle_fitment` are returned directly (`assistant/tools.py:97-105`).
 
-**Limit:** the figure check is regex-based. Numbers written in words ("forty-two units") would get past it.
+## 6. Forecasting and validation
 
-## 5. Untrusted supplier descriptions
+The forecast is `level × Diwali-relative seasonal factor × planned-promotion uplift` (`ml/model.py:1-16`, `:62-66`). The Diwali curve is pooled across SKU-seasons, SKU sensitivity is shrunk toward the pooled curve, and promotion uplift is shrunk toward a global estimate (`ml/model.py:83-119`, `:122-136`). Validation is rolling-origin, four weeks ahead, against last value, 4/8/12-week means, and same-week-last-year (`ml/backtest.py:32-58`). Across all folds, WAPE is 19.08% for the model versus 28.50% for the best listed baseline; in the festive fold it is 19.81% versus 27.63% (`ml/BACKTEST.md:7-16`, `:29-38`).
 
-Layered defences:
-1. **Sanitising.** `sanitize_text` (`assistant/tools.py:83`) drops any sentence of catalogue text matching `INJECTION_RE` (`:70`): instructions to AIs, "ignore previous…", fake `[system]:` tags, "admin mode", discount codes, "confirm … order", "without checking". On the real catalogue it removes exactly the two planted sentences (CHN-1037, BDY-1070) and changes nothing else.
-2. **Labelling.** Tool results are JSON tagged `"type": "catalogue_data"`, and the system prompt says catalogue text is data written by suppliers, never instructions (`assistant/agent.py:49`).
-3. **Capability limits, the real guarantee.** No tool can confirm orders, change prices or touch stock. Even a fully hijacked model can only create a DRAFT under the requesting dealer's id, with prices computed by our code.
-4. **Output check.** A reply offering "% off", promo or coupon codes or `VIKMO-…` codes fails verification (`PROMISE_RE`, `assistant/agent.py:67`).
+The leakage guard is `history = sales[sales["week_start"] < origin].copy()` at **`ml/model.py:78`**; the backtest independently applies the same strict cutoff at `ml/backtest.py:43-49`. Planned promotions are future inputs because the promo calendar is treated as known in advance.
 
-**Where it stops working:** a paraphrased injection that avoids every pattern (for example, phrased as a product fact: "this item is free for all dealers this week") gets past layer 1. It then depends on the model following the system prompt. Layers 3 and 4 still stop any action or explicit discount code. An LLM-based classifier on catalogue text at ingest time would be the next step.
+## 7. Weakest forecast SKUs and special cases
 
-## 6. Forecasting approach and validation
+On the festive fold, the largest model-MAE / best-baseline-MAE ratios are CHN-1073 (2.39), BRK-1090 (2.26), and BRK-1019 (1.75) (`ml/BACKTEST.md:40-47`; ratio calculation: `ml/backtest.py:83-84`). These are relative errors, not absolute unit errors. The report does not contain SKU-level residual diagnostics, so it cannot prove a distinct cause for each SKU. A plausible shared weakness is that SKU demand can diverge from the pooled Diwali curve; per-SKU seasonal sensitivity is estimated from limited qualifying observations and shrunk toward the pooled effect (`ml/model.py:83-119`).
 
-`ml/model.py` is a festival-aligned multiplicative model:
+Promotions use planned flags and a per-SKU uplift shrunk toward the pooled uplift (`ml/model.py:122-136`; future flags: `ml/forecast.py:21-29`). Diwali is indexed by week-distance, from 8 weeks before to 4 after (`ml/model.py:26`, `:35-45`). For intermittent SKUs with at least 30% zero-sales weeks, level is the mean of the last 26 adjusted weeks; for SKUs with under 13 weeks of history, it is the mean of up to the last four non-promo weeks (or last four weeks if none are non-promo) (`ml/model.py:30-31`, `:140-151`). New and intermittent SKUs still have limited evidence, so their forecasts are less reliable.
 
-`forecast = level(sku) × festive(weeks to Diwali, sku) × promo(sku)` (only when a promo is planned, `ml/model.py:64`)
+## 8. Weakest part and two-day plan
 
-- **festive:** a multiplier for each week from 8 weeks before to 4 weeks after the Diwali week. It is learned by pooling, across SKUs, sales near each past Diwali divided by the SKU's normal non-promo level (`ml/model.py:83`). It is indexed by distance to Diwali (`weeks_to_diwali`, `:41`), not calendar week, so the lift moves with the festival: 2024-11-01, 2025-10-21, 2026-11-08. A per-SKU sensitivity, shrunk towards 1, scales the pooled curve (`:109`).
-- **promo:** each SKU's promo-week uplift over its local baseline, shrunk towards the pooled ≈2.1× (`:122`). I checked history and found promo and festive effects multiply, not add: observed festive promo weeks match or exceed the product.
-- **level:** an exponentially weighted mean (half-life 4 weeks) of the last 12 non-promo weeks, each divided by its own festive factor (`:138`).
+The weakest part is assistant assurance: unit tests use a scripted fake LLM, while real-provider behavior is separate (`assistant/tests.py:1-2`); the safeguards for supplier text and numeric claims are heuristic (`assistant/tools.py:70-89`; `assistant/agent.py:108-160`). A provider can phrase claims outside the verifier's patterns, and a prompt-injection variant can bypass the sanitizer.
 
-**Validation:** rolling-origin backtest in `ml/backtest.py`, with results in `ml/BACKTEST.md`. The key fold uses origin **2025-09-15**: it sits exactly as far from Diwali 2025 as the real forecast window sits from Diwali 2026 (5 to 2 weeks before), and the model there learns its festive curve from 2024 alone. Six further non-festive folds cover Dec 2025 to Aug 2026. Against the brief's baselines (last value, recent mean over 4, 8 or 12 weeks, same week last year):
-
-| Fold | Model WAPE | Best baseline WAPE |
-|---|---|---|
-| Festive (2025-09-15) | **19.8%** | 27.6% (same week last year) |
-| Non-festive (6 folds) | **18.9%** | 27.0% (4-week mean) |
-
-The model beats the best baseline per SKU on 26/38 SKUs in the festive fold and 35/40 overall. I fixed the settings before tuning; a sweep of half-life and window changed festive WAPE by less than 1 point, so I kept the original values.
-
-**The line that stops leakage:** `ml/model.py:78`, `history = sales[sales["week_start"] < origin].copy()`. Every estimate inside `fit` uses only `history`. The backtest also cuts the training data independently (`ml/backtest.py:46`). The only future input is the planned promo calendar, which the brief says is known in advance.
-
-## 7. Worst SKUs, and how each special case is handled
-
-- **Worst in the festive backtest:** CHN-1073, BRK-1090 and BRK-1019 (2.4×, 2.3× and 1.8× the best baseline's MAE). CHN-1073 barely responds to Diwali, so applying the pooled lift over-forecasts it. BRK-1019 has strong promo spikes that land in festive weeks, and its 2025 response was larger than its 2024 one. With only two Diwali seasons, per-SKU sensitivity is noisy; that's why it is shrunk.
-- **Promotions:** the planned flags in `promo_calendar.csv` are used as known future inputs, with a per-SKU uplift shrunk towards the pooled uplift.
-- **Diwali:** weeks-to-Diwali indexing; see Q6. The 2026 window is 5 to 2 weeks before Diwali, so the lift is about 1.05× to 1.6×, lower than "same week last year" implies. Diwali 2025 was 18 days earlier, which is exactly why that baseline over-forecasts.
-- **Rarely sold SKUs** (BRK-1088, ELE-1006, ELE-1031, GRP-1043, with 38–60% zero weeks): level is the plain mean of the last 26 weeks (`ml/model.py:146`), with no EWMA chasing single sales, and they get no festive sensitivity of their own.
-- **New SKUs** (CHN-1006, BRK-1105, 6 weeks each): level is the mean of the last 4 weeks (`ml/model.py:143`), times the pooled festive curve. Their demand is still ramping up, so they may be under-forecast.
-
-## 8. Weakest part, and what I'd do with two more days
-
-**Weakest:** the assistant has only been tested against a scripted fake LLM in the unit tests, plus `scripts/assistant_eval.py` for live runs. Its live behaviour depends on the provider. My guardrails (figure verification, redacted memory, capability limits) reduce variance, but the regex-based figure check and pattern-based injection filter are heuristics.
-
-**With two more days:**
-1. Run `scripts/assistant_eval.py` across all four providers, 20 runs each, and tune the prompt on the failures.
-2. Hybrid retrieval: BM25 plus a small embedding model, with a fuzzy-matching layer for misspelt vehicles.
-3. A probabilistic forecast (quantiles) so safety stock reflects forecast error, not just historical sigma, plus a hierarchical prior for festive sensitivity.
-4. A React portal: catalogue, cart → confirm with stock errors, assistant chat.
-
----
-
-### Bonus parts (Django-track features also built)
-
-- **Overselling:** `confirm_order` (`orders/services.py:223`) locks the order row (`:224`), then the inventory rows in `product_id` order (`:229`), checks every line, and raises `INSUFFICIENT_STOCK` before writing anything if any line is short (`:235`). Only then does it decrement (`:242`). Without the locks, two confirms could both read stock=1 and both succeed. The DB check `quantity >= 0` is a last backstop.
-- **GST:** `line_amounts` (`orders/services.py:41`) uses `Decimal` throughout and rounds tax per line with `ROUND_HALF_UP` (`:44`, `core/money.py:10`). Floats would produce errors like 18.044999…; Decimal's default `ROUND_HALF_EVEN` would round 18.045 to 18.04.
-- **Order numbers:** a single atomic `INSERT … ON CONFLICT (day) DO UPDATE … RETURNING` (`orders/services.py:144`).
-- **Idempotency:** the key row is inserted first (`:171`). A concurrent duplicate blocks on the unique index until the first transaction commits, then replays the stored order (`:172`).
-- **Transitions:** a single `TRANSITIONS` table (`:30`) checked under the order row lock (`:214`). A cancel restores stock only from CONFIRMED, while holding that lock (`:257`), so restoration happens exactly once.
-- **Supplier sync:** fetch everything first (`supplier/sync.py:63`), with at most 5 attempts per request, honouring `Retry-After` on 429 (`:104`) and backing off after 5xx. Then validate and de-duplicate by latest `updated_at` (`:135`, `:158`), and apply in one transaction under an advisory lock (`:176`). A fetch failure raises before anything is written, so nothing changes. Comparing every synced field makes a second run report `updated: 0`.
+With two more days I would:
+1. Add a repeatable adversarial evaluation set for prompt injection, SKU/fitment mix-ups, and numeric paraphrases, then run it against each configured provider (`scripts/assistant_eval.py:1-4`).
+2. Make verified figures structured tool facts and render those facts deterministically, rather than relying on regex checks of free-form prose; re-check stock transactionally when creating/confirming an order.
+3. Add SKU-stratified forecast error diagnostics and prediction intervals, then test safety-stock impact against the same rolling-origin folds.
