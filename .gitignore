@@ -1,0 +1,17 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+node_modules/
+.idea/
+.vscode/
+*.sqlite3
+.DS_Store
+*.log
+staticfiles/
+
+# Original bundle material kept next to the code, not part of the submission
+starter/
+*.pdf

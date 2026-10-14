@@ -1,0 +1,15 @@
+Django>=5.1,<6
+djangorestframework>=3.15
+psycopg[binary]>=3.1
+dj-database-url>=2.1
+python-dotenv>=1.0
+requests>=2.31
+# Dealer Assistant: Gemini, Groq and OpenAI are called through the OpenAI-compatible SDK; Anthropic via its own SDK
+openai>=1.40
+anthropic>=0.40
+# Forecasting (ml/forecast.py) and the reorder endpoint
+numpy>=1.26
+pandas>=2.1
+# Streamlit dashboard (app.py)
+streamlit>=1.52,<2
+altair>=5.0,<7
