@@ -1,6 +1,6 @@
 > WATCH Video walkthrough -  [🎥 Watch the DealerDesk video walkthrough](https://drive.google.com/file/d/1r5fdaMXHL1KvNhJczqsf526Ea3BSEIGr/view?usp=sharing)
 
-# VIKMO DealerDesk
+# DealerDesk
 
 DealerDesk is a dealership parts and operations application. It combines a Streamlit dashboard for dealership staff, a Django REST API, PostgreSQL-backed business data, an LLM tool-calling assistant, supplier-feed synchronization, and machine-learning demand forecasts.
 
